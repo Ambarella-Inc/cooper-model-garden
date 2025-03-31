@@ -1,0 +1,186 @@
+diff --git a/tools/export_onnx.py b/tools/export_onnx.py
+index 8703166..d8be57f 100644
+--- a/tools/export_onnx.py
++++ b/tools/export_onnx.py
+@@ -11,7 +11,7 @@ from torch import nn
+ 
+ from yolox.exp import get_exp
+ from yolox.models.network_blocks import SiLU
+-from yolox.utils import replace_module
++from yolox.utils import replace_module, prune_global
+ 
+ 
+ def make_parser():
+@@ -54,7 +54,11 @@ def make_parser():
+         action="store_true",
+         help="decode in inference or not"
+     )
+-
++    parser.add_argument(
++        "--is_sparse",
++        action="store_true",
++        help="Apply masks for loading sparse checkpoints or not"
++    )
+     return parser
+ 
+ 
+@@ -69,6 +73,8 @@ def main():
+         args.experiment_name = exp.exp_name
+ 
+     model = exp.get_model()
++    model.eval()
++
+     if args.ckpt is None:
+         file_name = os.path.join(exp.output_dir, args.experiment_name)
+         ckpt_file = os.path.join(file_name, "best_ckpt.pth")
+@@ -78,10 +84,25 @@ def main():
+     # load the model state dict
+     ckpt = torch.load(ckpt_file, map_location="cpu")
+ 
+-    model.eval()
+     if "model" in ckpt:
+-        ckpt = ckpt["model"]
+-    model.load_state_dict(ckpt)
++        if args.is_sparse:
++            print("Pruning the model to sparsity: {}".format(0.0))
++            prune_global(model, amount=0.0)
++
++            new_state_dict = {}
++            if "model" in ckpt:
++                for key, value in ckpt["model"].items():
++                    # remove prefix "module."
++                    if key.startswith('module.'):
++                        new_key = key[7:]
++                    else:
++                        new_key = key
++                    new_state_dict[new_key] = value
++
++            model.load_state_dict(new_state_dict)
++        else:
++            model.load_state_dict(ckpt["model"])
++
+     model = replace_module(model, nn.SiLU, SiLU)
+     model.head.decode_in_inference = args.decode_in_inference
+ 
+diff --git a/tools/train.py b/tools/train.py
+index aa98bba..4c3f8aa 100644
+--- a/tools/train.py
++++ b/tools/train.py
+@@ -94,6 +94,11 @@ def make_parser():
+         default=None,
+         nargs=argparse.REMAINDER,
+     )
++    parser.add_argument(
++        "--sparsity",
++        default=0.0,
++        type=float,
++        help="Sparse model training using PyTorch's global L1 unstructured pruning")
+     return parser
+ 
+ 
+diff --git a/yolox/core/trainer.py b/yolox/core/trainer.py
+index 8f8016e..0a3eca1 100644
+--- a/yolox/core/trainer.py
++++ b/yolox/core/trainer.py
+@@ -30,7 +30,8 @@ from yolox.utils import (
+     occupy_mem,
+     save_checkpoint,
+     setup_logger,
+-    synchronize
++    synchronize,
++    prune_global
+ )
+ 
+ 
+@@ -44,6 +45,7 @@ class Trainer:
+         # training related attr
+         self.max_epoch = exp.max_epoch
+         self.amp_training = args.fp16
++        self.sparsity = args.sparsity
+         self.scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+         self.is_distributed = get_world_size() > 1
+         self.rank = get_rank()
+@@ -172,6 +174,11 @@ class Trainer:
+             self.ema_model = ModelEMA(model, 0.9998)
+             self.ema_model.updates = self.max_iter * self.start_epoch
+ 
++         # Add PyTorch pruning API
++        if self.sparsity > 0.0:
++            print("Pruning the model to sparsity: {}".format(self.sparsity))
++            prune_global(model, amount=self.sparsity)
++
+         self.model = model
+ 
+         self.evaluator = self.exp.get_evaluator(
+diff --git a/yolox/exp/yolox_base.py b/yolox/exp/yolox_base.py
+index 82e93c2..cfd3f37 100644
+--- a/yolox/exp/yolox_base.py
++++ b/yolox/exp/yolox_base.py
+@@ -68,20 +68,20 @@ class Exp(BaseExp):
+ 
+         # --------------  training config --------------------- #
+         # epoch number used for warmup
+-        self.warmup_epochs = 5
++        self.warmup_epochs = 4
+         # max training epoch
+-        self.max_epoch = 300
++        self.max_epoch = 20
+         # minimum learning rate during warmup
+         self.warmup_lr = 0
+         self.min_lr_ratio = 0.05
+         # learning rate for one image. During training, lr will multiply batchsize.
+-        self.basic_lr_per_img = 0.01 / 64.0
++        self.basic_lr_per_img = 0.001 / 24.0
+         # name of LRScheduler
+         self.scheduler = "yoloxwarmcos"
+         # last #epoch to close augmention like mosaic
+-        self.no_aug_epochs = 15
++        self.no_aug_epochs = 4
+         # apply EMA during training
+-        self.ema = True
++        self.ema = False
+ 
+         # weight decay of optimizer
+         self.weight_decay = 5e-4
+@@ -92,7 +92,7 @@ class Exp(BaseExp):
+         self.print_interval = 10
+         # eval period in epoch, for example,
+         # if set to 1, model will be evaluate after every epoch.
+-        self.eval_interval = 10
++        self.eval_interval = 2
+         # save history checkpoint or not.
+         # If set to False, yolox will only save latest and best ckpt.
+         self.save_history_ckpt = True
+diff --git a/yolox/utils/ema.py b/yolox/utils/ema.py
+index 73acbca..a613012 100644
+--- a/yolox/utils/ema.py
++++ b/yolox/utils/ema.py
+@@ -55,6 +55,6 @@ class ModelEMA:
+                 model.module.state_dict() if is_parallel(model) else model.state_dict()
+             )  # model state_dict
+             for k, v in self.ema.state_dict().items():
+-                if v.dtype.is_floating_point:
++                if k in msd.keys() and v.dtype.is_floating_point:
+                     v *= d
+                     v += (1.0 - d) * msd[k].detach()
+diff --git a/yolox/utils/model_utils.py b/yolox/utils/model_utils.py
+index 3bc2d1f..85c551a 100644
+--- a/yolox/utils/model_utils.py
++++ b/yolox/utils/model_utils.py
+@@ -16,8 +16,16 @@ __all__ = [
+     "replace_module",
+     "freeze_module",
+     "adjust_status",
++    "prune_global",
+ ]
+ 
++def prune_global(model, amount=0.5):
++    import torch.nn.utils.prune as prune
++    prune.global_unstructured(
++        parameters=[(module, 'weight') for module in model.modules() if hasattr(module, 'weight') and not isinstance(module, nn.BCEWithLogitsLoss)],
++        pruning_method=prune.L1Unstructured,
++        amount=amount
++    ) ## nn.BCEWithLogitsLoss got attr weight value "None", which will trigger "AttributeError: 'NoneType' object has no attribute 'is_cuda'"
+ 
+ def get_model_info(model: nn.Module, tsize: Sequence[int]) -> str:
+     from thop import profile

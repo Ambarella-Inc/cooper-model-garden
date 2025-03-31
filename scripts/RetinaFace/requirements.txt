@@ -1,0 +1,10 @@
+bbox
+Cython
+ipython
+numpy
+onnxruntime
+opencv_python
+scipy
+torch
+torchvision
+tqdm
